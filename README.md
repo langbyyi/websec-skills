@@ -1,6 +1,6 @@
 # websec-skills
 
-Web 安全漏洞测试技能集，包含 43 个漏洞类型的攻击 Playbook，用于 AI Agent 辅助安全测试。
+Web 安全漏洞测试技能集，包含 44 个漏洞类型的攻击 Playbook，用于 AI Agent 辅助安全测试。
 
 ## 技能列表
 
@@ -48,6 +48,7 @@ Web 安全漏洞测试技能集，包含 43 个漏洞类型的攻击 Playbook，
 | **移动安全** | [mobile-security](mobile-security/) | Android/iOS 安全测试 |
 | **工具与侦察** | [burp-mcp](burp-mcp/) | Burp Suite MCP 自动化 |
 | | [recon-and-methodology](recon-and-methodology/) | 侦察与方法论 |
+| | [cyberstrike-eino-demo](cyberstrike-eino-demo/) | CyberStrike Eino 满配示例技能包 |
 
 ## 使用方式
 
